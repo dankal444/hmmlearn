@@ -13,7 +13,7 @@ The :mod:`hmmlearn.hmm` module implements hidden Markov models.
 import numpy as np
 from sklearn import cluster
 from sklearn.mixture import (
-    GMM, sample_gaussian,
+    GMM, GaussianMixture, sample_gaussian,
     log_multivariate_normal_density,
     distribute_covar_matrix_to_match_covariance_type, _validate_covars)
 from sklearn.utils import check_random_state
@@ -558,21 +558,28 @@ class GMMHMM(_BaseHMM):
         self.gmms_ = []
         for x in range(self.n_components):
             if covariance_type is None:
-                gmm = GMM(n_mix, random_state=self.random_state)
+                gmm = GaussianMixture(n_mix, random_state=self.random_state)
             else:
-                gmm = GMM(n_mix, covariance_type=covariance_type,
+                gmm = GaussianMixture(n_mix, covariance_type=covariance_type,
                         random_state=self.random_state)
             self.gmms_.append(gmm)
 
     def _init(self, X, lengths=None):
         super(GMMHMM, self)._init(X, lengths=lengths)
 
-        for g in self.gmms_:
-            g.set_params(init_params=self.init_params, n_iter=0)
-            g.fit(X)
+        # uniform segmentation
+        labels = []
+        for length in lengths:
+            labels.append(np.round(np.linspace(-0.49, self.n_components, length+0.49)).astype(np.int32))
+        labels = np.concatenate(labels)
+
+        for i_state, g in enumerate(self.gmms_):
+            state_X = X[labels == i_state]
+            g.set_params(init_params='kmeans', max_iter=1)
+            g.fit(state_X)
 
     def _compute_log_likelihood(self, X):
-        return np.array([g.score(X) for g in self.gmms_]).T
+        return np.array([g.score_samples(X) for g in self.gmms_]).T
 
     def _generate_sample_from_state(self, state, random_state=None):
         return self.gmms_[state].sample(1, random_state=random_state).flatten()
@@ -581,7 +588,7 @@ class GMMHMM(_BaseHMM):
         stats = super(GMMHMM, self)._initialize_sufficient_statistics()
         stats['norm'] = [np.zeros(g.weights_.shape) for g in self.gmms_]
         stats['means'] = [np.zeros(np.shape(g.means_)) for g in self.gmms_]
-        stats['covars'] = [np.zeros(np.shape(g.covars_)) for g in self.gmms_]
+        stats['covars'] = [np.zeros(np.shape(g.covariances_)) for g in self.gmms_]
         return stats
 
     def _accumulate_sufficient_statistics(self, stats, X, framelogprob,
@@ -596,14 +603,15 @@ class GMMHMM(_BaseHMM):
             gmm_posteriors = np.exp(lgmm_posteriors)
 
             n_features = g.means_.shape[1]
-            tmp_gmm = GMM(g.n_components, covariance_type=g.covariance_type)
-            tmp_gmm._set_covars(
-                distribute_covar_matrix_to_match_covariance_type(
-                    np.eye(n_features), g.covariance_type,
-                    g.n_components))
-            norm = tmp_gmm._do_mstep(X, gmm_posteriors, self.params)
+            tmp_gmm = GaussianMixture(g.n_components, covariance_type=g.covariance_type)
+            if g.covariance_type is 'diag':
+                tmp_gmm.covariances_ = np.tile(np.diag(np.eye(n_features)), (g.n_components, 1))
+            else:
+                raise NotImplementedError
 
-            if np.any(np.isnan(tmp_gmm.covars_)):
+            norm = gmm_posteriors.sum(axis=0)
+            tmp_gmm._m_step(X, lgmm_posteriors)
+            if np.any(np.isnan(tmp_gmm.covariances_)):
                 raise ValueError
 
             stats['norm'][state] += norm
@@ -614,10 +622,10 @@ class GMMHMM(_BaseHMM):
                     stats['covars'][state] += tmp_gmm.covars_ * norm.sum()
                 else:
                     cvnorm = np.copy(norm)
-                    shape = np.ones(tmp_gmm.covars_.ndim, dtype=np.int)
-                    shape[0] = np.shape(tmp_gmm.covars_)[0]
+                    shape = np.ones(tmp_gmm.covariances_.ndim, dtype=np.int)
+                    shape[0] = np.shape(tmp_gmm.covariances_)[0]
                     cvnorm.shape = shape
-                    stats['covars'][state] += (tmp_gmm.covars_
+                    stats['covars'][state] += (tmp_gmm.covariances_
                                                + tmp_gmm.means_**2) * cvnorm
 
     def _do_mstep(self, stats):
@@ -635,19 +643,19 @@ class GMMHMM(_BaseHMM):
                 g.means_ = stats['means'][state] / norm[:, np.newaxis]
             if 'c' in self.params:
                 if g.covariance_type == 'tied':
-                    g.covars_ = ((stats['covars'][state]
-                                 + self.covars_prior * np.eye(n_features))
-                                 / norm.sum())
+                    g.covariances_ = ((stats['covars'][state]
+                                       + self.covars_prior * np.eye(n_features))
+                                      / norm.sum())
                 else:
                     cvnorm = np.copy(norm)
-                    shape = np.ones(g.covars_.ndim, dtype=np.int)
-                    shape[0] = np.shape(g.covars_)[0]
+                    shape = np.ones(g.covariances_.ndim, dtype=np.int)
+                    shape[0] = np.shape(g.covariances_)[0]
                     cvnorm.shape = shape
                     if g.covariance_type in ['spherical', 'diag']:
-                        g.covars_ = (stats['covars'][state] +
-                                     self.covars_prior) / cvnorm - g.means_**2
+                        g.covariances_ = (stats['covars'][state] +
+                                          self.covars_prior) / cvnorm - g.means_**2
                     elif g.covariance_type == 'full':
                         eye = np.eye(n_features)
-                        g.covars_ = ((stats['covars'][state]
-                                     + self.covars_prior * eye[np.newaxis])
-                                     / cvnorm) - g.means_**2
+                        g.covariances_ = ((stats['covars'][state]
+                                           + self.covars_prior * eye[np.newaxis])
+                                          / cvnorm) - g.means_**2
